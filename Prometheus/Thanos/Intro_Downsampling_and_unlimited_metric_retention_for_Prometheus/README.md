@@ -110,3 +110,186 @@ docker run -d --net=host --rm \
     --query.replica-label replica \
     --store 127.0.0.1:19190
 ```
+
+## Step 2 - Object Storage Continuous Backup
+
+Maintaining one year of data within your Prometheus is doable, but not easy. It's tricky to resize, backup or maintain this data long term. On top of that Prometheus does not do any replication, so any unavailability of Prometheus results in query unavailability.
+
+This is where Thanos comes to play. With a single configuration change we can allow Thanos Sidecar to continuously upload blocks of metrics that are periodically persisted to disk by the Prometheus.
+
+**NOTE**: Prometheus when scraping data, initially aggregates all samples in memory and WAL (on-disk write-head-log). Only after 2-3h it "compacts" the data into disk in form of 2h TSDB block. This is why we need to still query Prometheus for latest data, but overall with this change we can keep Prometheus retention to minimum. It's recommended to keep Prometheus retention in this case at least 6 hours long, to have safe buffer for a potential event of network partition.
+
+#### Starting Object Storage: Minio
+Let's start simple S3-compatible Minio engine that keeps data in local disk:
+```
+mkdir /root/minio && \
+docker run -d --rm --name minio \
+     -v /root/minio:/data \
+     -p 9000:9000 -e "MINIO_ACCESS_KEY=minio" -e "MINIO_SECRET_KEY=melovethanos" \
+     minio/minio:RELEASE.2019-01-31T00-31-19Z \
+     server /data
+```
+
+Create thanos bucket:
+
+```
+mkdir /root/minio/thanos
+```
+
+#### Sidear block backup
+
+All Thanos components that use object storage uses the same `objstore.config` flag with the same "little" bucket config format.
+
+```
+type: S3
+config:
+  bucket: "thanos"
+  endpoint: "127.0.0.1:9000"
+  insecure: true
+  signature_version2: true
+  access_key: "minio"
+  secret_key: "melovethanos"
+```
+Let's restart sidecar with updated configuration in backup mode.
+```
+docker stop prometheus-0-eu1-sidecar
+```
+Thanos sidecar allows to backup all the blocks that Prometheus persits to the disk. In order to accomplish this we need to make sure that:
+
+- Sidecar has direct access to the Prometheus data directory (in our case host's /root/prom-eu1 dir) (`--tsdb.path` flag)
+- Bucket configuration is specified `--objstore.config-file`
+- `--shipper.upload-compacted` has to be set if you want to upload already compacted blocks when sidecar starts. Use this only when you want to upload blocks never seen before on new Prometheus introduced to Thanos system.
+
+
+Let's run sidecar:
+
+```
+docker run -d --net=host --rm \
+    -v /root/editor/bucket_storage.yaml:/etc/thanos/minio-bucket.yaml \
+    -v /root/prom-eu1:/prometheus \
+    --name prometheus-0-eu1-sidecar \
+    -u root \
+    quay.io/thanos/thanos:v0.16.0 \
+    sidecar \
+    --tsdb.path /prometheus \
+    --objstore.config-file /etc/thanos/minio-bucket.yaml \
+    --shipper.upload-compacted \
+    --http-address 0.0.0.0:19090 \
+    --grpc-address 0.0.0.0:19190 \
+    --prometheus.url http://127.0.0.1:9090
+```
+
+## Step 3 - Fetching metrics from Bucket
+
+In this step, we will learn about Thanos Store Gateway and how to deploy it.
+
+#### Thanos Components
+Let's take a look at all the Thanos commands:
+```
+docker run --rm quay.io/thanos/thanos:v0.16.0 --help
+```
+You should see multiple commands that solve different purposes, block storage based long-term storage for Prometheus.
+
+In this step we will focus on thanos `store gateway`:
+```
+  store [<flags>]
+    Store node giving access to blocks in a bucket provider
+```
+
+#### Store Gateway:
+
+- This component implements the Store API on top of historical data in an object storage bucket. It acts primarily as an API gateway and therefore does not need significant amounts of local disk space.
+- It keeps a small amount of information about all remote blocks on the local disk and keeps it in sync with the bucket. This data is generally safe to delete across restarts at the cost of increased startup times.
+
+#### Deploying store for "EU1" Prometheus data
+```
+docker run -d --net=host --rm \
+    -v /root/editor/bucket_storage.yaml:/etc/thanos/minio-bucket.yaml \
+    --name store-gateway \
+    quay.io/thanos/thanos:v0.16.0 \
+    store \
+    --objstore.config-file /etc/thanos/minio-bucket.yaml \
+    --http-address 0.0.0.0:19091 \
+    --grpc-address 0.0.0.0:19191
+```
+#### How to query Thanos store data?
+In this step, we will see how we can query Thanos store data which has access to historical data from the thanos bucket, and play with this setup a bit.
+
+Currently querier does not know about store yet. Let's change it by adding Store Gateway gRPC address `--store 127.0.0.1:19191` to Querier:
+
+```
+docker stop querier && \
+docker run -d --net=host --rm \
+   --name querier \
+   quay.io/thanos/thanos:v0.16.0 \
+   query \
+   --http-address 0.0.0.0:9091 \
+   --query.replica-label replica \
+   --store 127.0.0.1:19190 \
+   --store 127.0.0.1:19191
+
+```
+
+Click on the Querier UI Graph page and try querying data for a year or two by inserting metrics `continuous_app_metric0`(Query UI). Make sure `deduplication` is selected and you will be able to discover all the data fetched by Thanos store.
+
+Also, you can check all the active endpoints located by thanos-store by clicking on Stores.
+
+#### What we know so far?
+We've added Thanos Query, a component that can query a Prometheus instance and Thanos Store at the same time, which gives transparent access to the archived blocks and real-time metrics. The vanilla PromQL Prometheus engine used inside Query deduces what time series and for what time ranges we need to fetch the data for.
+
+Also, StoreAPIs propagate external labels and the time range they have data for, so we can do basic filtering on this. However, if you don't specify any of these in the query (only "up" series) the querier concurrently asks all the StoreAPI servers.
+
+The potential duplication of data between Prometheus+sidecar results and store Gateway will be transparently handled and invisible in results.
+
+#### Checking what StoreAPIs are involved in query
+
+Another interesting question here is how to ensure if we query the data from bucket only?
+
+We can check this by visitng the New UI), inserting continuous_app_metric0 metrics again with 1 year time range of graph, and click on `Enable Store Filtering`.
+
+This allows us to filter stores and helps in debugging from where we are querying the data exactly.
+
+Let's chose only `127.0.0.1:19191`, so store gateway. This query will only hit that store to retrieve data, so we are sure that store works.
+
+## Step 4 - Thanos Compactor
+
+In this step, we will install Thanos Compactor which applies the compaction, retention, deletion and downsampling operations on the TSDB block data object storage.
+
+Before, moving forward, let's take a closer look at what the `Compactor` component does:
+
+**Note**: Thanos Compactor is currently designed to be run as a singleton. Unavailability (hours) is not problematic as it does not serve any live requests.
+
+#### Compactor
+The Compactor is an essential component that operates on a single object storage bucket to compact, downsample, apply retention, to the TSDB blocks held inside, thus, making queries on historical data more efficient. It creates aggregates of old metrics (based upon the rules).
+
+It is also responsible for downsampling of data, performing 5m downsampling after 40 hours, and 1h downsampling after 10 days.
+
+**Note**: Thanos Compactor is mandatory if you use object storage otherwise Thanos Store Gateway will be too slow without using a compactor.
+
+#### Deploying Thanos Compactor
+```
+docker run -d --net=host --rm \
+ -v /root/editor/bucket_storage.yaml:/etc/thanos/minio-bucket.yaml \
+    --name thanos-compact \
+    quay.io/thanos/thanos:v0.16.0 \
+    compact \
+    --wait --wait-interval 30s \
+    --consistency-delay 0s \
+    --objstore.config-file /etc/thanos/minio-bucket.yaml \
+    --http-address 0.0.0.0:19095
+```
+
+The flag wait is used to make sure all compactions have been processed while --wait-interval is kept in 30s to perform all the compactions and downsampling very quickly. Also, this only works when when --wait flag is specified. Another flag --consistency-delay is basically used for buckets which are not consistent strongly. It is the minimum age of non-compacted blocks before they are being processed. Here, we kept the delay at 0s assuming the bucket is consistent.
+
+#### Compaction and Downsampling
+
+When we query large historical data there are millions of samples that we need to go through which makes the queries slower and slower as we retrieve year's worth of data.
+
+Thus, Thanos uses the technique called downsampling (a process of reducing the sampling rate of the signal) to keep the queries responsive, and no special configuration is required to perform this process.
+
+The Compactor applies compaction to the bucket data and also completes the downsampling for historical data.
+
+To expierience this, click on the Querier and insert metrics continuous_app_metric0 with 1 year time range of graph, and also, click on Enable Store Filtering.
+
+Let's try querying Max 5m downsampling data, it uses 5m resolution and it will be faster than the raw data. Also, Downsampling is built on top of data, and never done on young data.
+
