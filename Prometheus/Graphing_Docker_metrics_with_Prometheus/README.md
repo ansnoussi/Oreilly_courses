@@ -83,7 +83,7 @@ If you're interested in seeing the raw metrics, they can be viewed with `curl lo
 
 With the containers launched, Prometheus will scrape and store the data based on the internals in the configuration.
 
-Dashboards
+#### Dashboards
 
 The default Prometheus Dashboard reports internal information and provides a way to debug the metrics being collected.
 
@@ -99,7 +99,7 @@ For example, querying for `engine_daemon_container_actions_seconds_sum` will sho
 
 The host metrics can be viewed too, for example, `node_cpu` will output the Docker Hosts CPU information.
 
-Generate Metrics
+#### Generate Metrics
 
 Running additional containers will result in changes to the metrics produced, which are viewable via the graphs and queries.
 ```

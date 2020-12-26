@@ -1,0 +1,1 @@
+Introduction to CNCF Thanos: Global, Scalable and Highly Available Prometheus setup.

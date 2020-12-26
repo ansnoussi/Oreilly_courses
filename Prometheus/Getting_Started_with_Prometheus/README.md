@@ -62,7 +62,7 @@ If you're interested in seeing the raw metrics, they can be viewed with `curl lo
 
 With the containers launched, Prometheus will scrape and store the data based on the internals in the configuration.
 
-Dashboards
+#### Dashboards
 
 The default Prometheus Dashboard reports internal information and provides a way to debug the metrics being collected.
 
@@ -70,7 +70,7 @@ The dashboard will report the status of the scraping and the different targets a
 
 When running in production, you may wish to build a dashboard using Grafana, or a hosted Prometheus instance such as Weave Cortex.
 
-Query Prometheus
+#### Query Prometheus
 
 To query the underlying metrics and create graphs, visit the graph page on the Dashboard
 From here different metrics are queryable based on their name.
